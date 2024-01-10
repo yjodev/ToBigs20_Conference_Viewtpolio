@@ -1,0 +1,1122 @@
+---
+title: "Network Portfolio"
+author: "Yujin Oh"
+date: "2023-12-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(stats)
+library(lubridate)
+library(stringr)
+library(tidyverse)
+library(igraph)
+theme_set(theme_grey(base_family="NanumGothic"))
+
+```
+
+
+## 주식 포트폴리오 추천을 위한 주식 시장 네트워크 분석 구현해보기  (trial)
+```{r}
+
+# 데이터 준비
+# port<-read.csv("./data/market_equity_kospi.csv") 
+# head(port)
+# dim(port)
+
+top<-read.csv("./data/top50_df.csv") # 2007.01.02 ~ 2022.09.14 시점별(20영업일) 시가총액 상위 50개 기업 리스트
+head(top)
+dim(top) # 50 196
+jan_2007_list <- top[,2] # 2007년 1월 시가총액 상위 50개 기업 리스트
+
+port<-read.csv("./data/close.csv") 
+head(port) # 2000-01-04 ~ 2023-10-05 일자별 종가 (1200개 기업, 첫 번째 열 X 는 일자)
+dim(port) #  5865 1201
+
+port$X <- ymd(port$X) 
+
+# Filter 종가데이터 (port) for January 2007
+port_jan_2007 <- port %>%
+  filter(X >= as.Date("2007-01-01") & X <= as.Date("2007-01-29")) # 20영업일 기준 
+
+# Display the first few rows of the filtered data
+head(port_jan_2007)
+
+existing_cols <- intersect(jan_2007_list, names(port_jan_2007))
+
+port_jan_2007 <- port_jan_2007 %>%
+  select(where(~ !any(is.na(.))))%>%
+  select(all_of(existing_cols))
+
+
+head(port_jan_2007)
+dim(port_jan_2007) # 20 49 : 20영업일간 49개의 기업의 시가총액 (하나는 없음)
+```
+
+```{r}
+# 문자열을 숫자로 변환하는 함수 정의
+convert_to_numeric <- function(x) {
+  as.numeric(str_remove_all(x, ","))
+}
+
+# 'port_jan_2007'의 모든 열을 숫자로 변환 (현재는 콤마 있는 chr)
+port_jan_2007 <- port_jan_2007 %>%
+  mutate(across(everything(), convert_to_numeric))
+
+# 로그 수익률 계산
+log_returns_df <- port_jan_2007 %>%
+  mutate(across(everything(), ~log(. / lag(.)))) %>%
+  na.omit() # lag 연산으로 인해 발생하는 NA 값 제거
+
+# 로그 수익률 데이터프레임의 처음 몇 행 출력
+head(log_returns_df)
+dim(log_returns_df) # 19 49
+
+# 교차 상관계수 계산 함수 정의
+calculate_cross_correlation <- function(stock1, stock2) {
+  mean1 <- mean(stock1)
+  mean2 <- mean(stock2)
+  covariance <- mean(stock1 * stock2) - mean1 * mean2
+  std_dev1 <- sqrt(mean(stock1^2) - mean1^2)
+  std_dev2 <- sqrt(mean(stock2^2) - mean2^2)
+  
+  return(covariance / (std_dev1 * std_dev2))
+}
+
+# 모든 주식 쌍에 대한 교차 상관계수 계산
+n <- ncol(log_returns_df)
+correlation_matrix <- matrix(NA, nrow = n, ncol = n)
+colnames(correlation_matrix) <- names(log_returns_df)
+rownames(correlation_matrix) <- names(log_returns_df)
+
+for (i in 1:n) {
+  for (j in 1:n) {
+    if (i == j) {
+      correlation_matrix[i, j] <- 1 # i = j 일 때 상관계수를 1로 설정
+    } else if (j > i) {
+      correlation_matrix[i, j] <- calculate_cross_correlation(log_returns_df[[i]], log_returns_df[[j]])
+      correlation_matrix[j, i] <- correlation_matrix[i, j] # 상관계수 행렬은 대칭
+    }
+  }
+}
+
+# 결과 출력
+#head(correlation_matrix)
+dim(correlation_matrix) # 49 49 
+```
+
+
+
+
+최소신장트리 (option)
+```{r}
+# 필요한 라이브러리 불러오기
+library(igraph)
+
+# 주식 간 거리 계산
+# 상관계수 행렬을 거리 행렬로 변환합니다. 거리는 1 - 상관계수로 계산합니다.
+distance_matrix <- sqrt(2 * (1 - correlation_matrix))
+
+# 주식 그래프 생성
+graph <- graph.adjacency(distance_matrix, mode="undirected", weighted=TRUE)
+graph <- simplify(graph) # 중복된 엣지와 루프 제거
+
+# Kruskal 알고리즘을 사용하여 최소신장트리 생성
+#mst <- mst(graph, algorithm="kruskal")
+mst <- mst(graph)
+
+# 최소신장트리 시각화 (옵션)
+plot(mst)
+
+plot(mst, 
+     vertex.label = NA, # 정점 라벨을 숨깁니다
+     vertex.size = 5, # 정점의 크기를 조정합니다
+     edge.width = 2, # 엣지의 너비를 조정합니다
+     edge.color = "blue", # 엣지 색상을 지정합니다
+     layout = layout_nicely(mst) # 그래프 레이아웃을 자동으로 조정합니다
+     )
+```
+
+```{r}
+# K-means 클러스터링 수행
+set.seed(123) # 재현 가능한 결과를 위해 시드 설정
+kmeans_result <- kmeans(correlation_matrix, centers=10)
+
+# 클러스터링 결과에 따라 주식을 그룹화
+clusters <- kmeans_result$cluster
+```
+
+```{r}
+list <- colnames(port)[-1]
+head(list)
+length(list)
+
+list bind$종목코드 
+bind$WICS2
+```
+
+
+
+```{r}
+selected_stocks <- vector("list", length = 10) # 각 클러스터별로 선택된 주식을 저장할 리스트
+
+for (i in 1:10) {
+  cluster_stocks <- names(which(clusters == i))
+  cluster_matrix <- correlation_matrix[cluster_stocks, cluster_stocks]
+  
+  # 네트워크 생성
+  g <- graph.adjacency(cluster_matrix, mode = "undirected", weighted = TRUE)
+  g <- simplify(g)
+  
+  # 차수 계산
+  degrees <- degree(g)
+  
+  # 차수가 1인 노드 선택, 없으면 가장 낮은 차수의 노드 선택
+  min_degree_nodes <- names(which(degrees == min(degrees)))
+  selected_stock <- sample(min_degree_nodes, 1) # 무작위로 하나 선택
+  
+  selected_stocks[[i]] <- selected_stock
+}
+
+# 선택된 주식 리스트 출력
+selected_stocks
+
+```
+
+
+## * 전체 구간 반복문 
+
+```{r}
+# 문자열을 숫자로 변환하는 함수 정의
+convert_to_numeric <- function(x) {
+  as.numeric(str_remove_all(x, ","))
+}
+
+# 교차 상관계수 계산 함수 정의
+calculate_cross_correlation <- function(stock1, stock2) {
+  mean1 <- mean(stock1, na.rm = TRUE)
+  mean2 <- mean(stock2, na.rm = TRUE)
+  covariance <- mean(stock1 * stock2, na.rm = TRUE) - mean1 * mean2
+  std_dev1 <- sqrt(mean(stock1^2, na.rm = TRUE) - mean1^2)
+  std_dev2 <- sqrt(mean(stock2^2, na.rm = TRUE) - mean2^2)
+  
+  return(covariance / (std_dev1 * std_dev2))
+}
+
+# 데이터 로딩
+WICS_122 <- read.csv("./data/WICS_122.csv")
+top <- read.csv("./data/top50_df2.csv")
+port <- read.csv("./data/close.csv")
+port$X <- ymd(port$X)  # 날짜 형식 변환
+
+# 결과를 저장할 데이터 프레임 생성
+selected_stocks_df <- data.frame(matrix(ncol = dim(top)[2]-1, nrow = 10))
+colnames(selected_stocks_df) <- colnames(top)[-1]  # 첫 열 제외
+```
+
+## 섹터 붙이고 WICS 기준으로 재분류 
+
+### 1. 대상 좁히기 
+top50_df 기준 unique한 종목만 남기기 
+```{r}
+top <- read.csv("./data/top50_df2.csv")
+head(top)
+dim(top)
+top_df <- top[-1]
+dim(top_df)
+
+column_as_list <- list()
+
+for (i in seq_along(colnames(top_df))) {
+  print(i)
+  i_list <- as.list(top_df[[i]])
+  
+  column_as_list <- c(column_as_list, i_list)
+  print(length(column_as_list))
+}
+
+unique_values <- unique(column_as_list)
+length(unique_values) # 108개 밖에 안되자나 ! 
+```
+
+
+
+### 2. KRX에서 종목코드,종목명,업종명 가져와서 붙이기 
+
+
+
+- 노가다 
+```{r}
+sector_2015 <- read.csv("./data/code_sector_2015.csv", ,fileEncoding = "euc-kr")
+sector_2023 <- read.csv("./data/code_sector_2023.csv",fileEncoding = "euc-kr")
+
+sector_2015 <- sector_2015 %>% select('종목코드','종목명','업종명')
+sector_2023 <- sector_2023 %>% select('종목코드','종목명','업종명')
+
+
+bind <- rbind(sector_2015, sector_2023) %>%
+  arrange(종목코드) %>%
+  distinct(종목코드, .keep_all = TRUE) # 1046
+
+bind$종목코드 <- sapply(bind$종목코드, function(code) {
+  code <- as.character(code)
+  if (nchar(code) < 6) {
+    code <- paste0("A", strrep("0", 6 - nchar(code)), code)
+  } else if (nchar(code) == 6 && !startsWith(code, "A")) {
+    code <- paste0("A", code)
+  }
+  return(code)
+})
+
+bind$업종명 <- as.factor(bind$업종명)
+table(bind$업종명) # factor with 24 levels
+
+# 확인용.
+tmp <- bind %>% 
+  filter(bind['종목명'] == '한국가스공사')
+tmp
+
+
+tmp <- bind %>% 
+  filter(bind['업종명'] == '의료정밀')
+tmp
+
+
+bind_unique <- bind %>%
+  filter(bind$종목코드 %in% unique_values )
+
+bind_unique
+
+arrange(unique_values)
+
+```
+
+
+### 2. WICS 기준으로 업종명 붙이기 
+```{r}
+# [KRX] -> [WICS]
+# 화학 -> 에너지 
+# 철강금속, 종이목재,비금속광물 -> 소재
+# 운수창고업, 건설업, 기계 -> 산업재 
+# 운수장비, 유통업, 섬유의복 -> 경기관련소비재 
+# 음식료품,기타제조업 -> 필수소비재 
+# 의약품, 의료정밀 -> 건강관리
+# 기타금융, 보험, 은행, 증권 -> 금융
+# 전기전자 -> IT
+# 통신업 -> 커뮤니케이션서비스 
+# 전기가스업 -> 유틸리티 
+
+# 광업, 농업 임업 및 어업 -> drop
+# 서비스업 -> 금융(~홀딩스, ~리츠), 커뮤니케이션서비스 , IT, 경기관련소비재
+
+
+# Define the mapping dictionary
+mapping_dict <- c(
+  '화학' = '에너지',
+  '철강금속' = '소재',
+  '종이목재' = '소재',
+  '비금속광물' = '소재',
+  '운수창고업' = '산업재',
+  '건설업' = '산업재',
+  '기계' = '산업재',
+  '운수장비' = '경기관련소비재',
+  '유통업' = '경기관련소비재',
+  '섬유의복' = '경기관련소비재',
+  '음식료품' = '필수소비재',
+  '기타제조업' = '필수소비재',
+  '의약품' = '건강관리',
+  '의료정밀' = '건강관리',
+  '기타금융' = '금융',
+  '보험' = '금융',
+  '은행' = '금융',
+  '증권' = '금융',
+  '전기전자' = 'IT',
+  '통신업' = '커뮤니케이션서비스',
+  '전기가스업' = '유틸리티',
+  '광업' = 'drop' , 
+  '농업, 임업 및 어업' = 'drop',
+  '서비스업' = 'manual_assignment'
+)
+
+
+
+bind$WICS <- mapping_dict[bind$업종명]
+
+  
+# Create the 'WICS' column based on the mapping dictionary
+bind <- bind %>%
+  mutate(WICS = case_when(
+    업종명 %in% names(mapping_dict) ~ mapping_dict[업종명],
+    업종명 %in% c('광업', '농업, 임업 및 어업') ~ 'drop',
+    업종명 == '서비스업' & grepl('홀딩스|리츠|지주', 종목명) ~ '금융',
+    TRUE ~ 'manual_assignment'  # Assign 'manual_assignment' for manual categorization
+  )) %>%
+  filter(WICS != 'drop')  # Remove rows with 'drop' in the 'WICS' column
+
+
+manual <- bind %>% filter(bind['WICS'] == 'manual_assignment') 
+dim(manual) # 126개 수동 분류 ; 
+manual
+```
+
+
+
+### 3. WICS 크롤링해서 붙이기  
+
+http://www.wiseindex.com/Index/GetIndexComponets2ceil_yn=0&dt=202000826&sec_cd=G10
+
+```{r}
+library(jsonlite)
+sector.code = c(
+  'G10', # 에너지
+  'G15', # 소재
+  'G20', # 산업재
+  'G25', # 경기관소비재
+  'G30', # 필수소비재
+  'G35', # 건강관리
+  'G40', # 금융
+  'G45', # IT
+  'G50', # 전기통신서비스
+  'G55'  # 유틸리티
+)
+
+data_sector = list()
+bizday = '20190220'
+
+for (i in sector.code) {
+	  print(i)
+    url = paste0(
+    	'http://www.wiseindex.com/Index/GetIndexComponets',
+        '?ceil_yn=0&dt=', bizday, '&sec_cd=', i)
+    
+    data = fromJSON(url)
+    data = data$list
+    
+    data_sector[[i]] = data
+    
+    Sys.sleep(1)
+}
+
+
+data_sector = do.call(rbind, data_sector)
+
+#write.csv(data_sector, './Data/WISC_sector.csv')
+
+data_sector$CMP_CD <- sapply(data_sector$CMP_CD, function(code) {
+  code <- as.character(code)
+  if (nchar(code) < 6) {
+    code <- paste0("A", strrep("0", 6 - nchar(code)), code)
+  } else if (nchar(code) == 6 && !startsWith(code, "A")) {
+    code <- paste0("A", code)
+  }
+  return(code)
+})
+
+
+WICS_122 <- data_sector %>%
+  filter(data_sector$CMP_CD %in% unique_values) %>%
+  select('CMP_CD', 'CMP_KOR', 'SEC_NM_KOR')
+
+dim(WICS_122) # 104개만 붙었다. 남은 18개는? 이전 기업이 상장폐지되거나 새로 생긴 기업들.  엑셀에서 직접뭍임
+```
+
+
+```{r}
+WICS_122 <- read.csv("./data/WICS_122.csv")
+dim(WICS_122)
+WICS_122 <- WICS_122[,-c(4,5,6)]
+
+table(WICS_122$SEC_NM_KOR)
+
+
+
+
+
+sector_freq_df <- as.data.frame(table(WICS_122$SEC_NM_KOR))
+names(sector_freq_df) <- c("Sector", "Frequency")
+sector_freq_df <- sector_freq_df[order(-sector_freq_df$Frequency), ]
+
+theme_set(theme_grey(base_family="NanumGothic"))
+
+ggplot(sector_freq_df, aes(x = reorder(Sector, -Frequency), y = Frequency, fill = Sector)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = Frequency), vjust = -0.3) + # 막대 위에 빈도 표시
+  theme_minimal() + # 불필요한 배경 및 격자 제거
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) + # X 축 라벨 회전
+  labs(title = "Sector Histogram", x = "Sector", y = "Frequency")
+
+
+ggplot(sector_freq_df, aes(x = reorder(Sector, -Frequency), y = Frequency, fill = Sector)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = Frequency), vjust = -0.3) + # 막대 위에 빈도 표시
+  theme(
+    panel.background = element_blank(), # 패널 배경 제거
+    panel.grid.major = element_blank(), # 주요 격자 제거
+    panel.grid.minor = element_blank(), # 부차적 격자 제거
+    axis.text.x = element_text(angle = 60, hjust = 1, family = "NanumGothic") # X 축 라벨 회전 및 폰트 설정
+  ) +
+  ylim(0,35) +
+  labs(title = "Sector Histogram", x = "Sector", y = "Frequency")
+
+```
+
+새로운 top_50.csv 도 122개 안에 포함됨 
+```{r}
+W<- as.list(WICS_122$CMP_CD) 
+
+for (i in 1:length(unique_values)) {
+  if (!(unique_values[i] %in% W)) {
+    print(paste(i, unique_values[i]))
+  }
+}
+```
+
+```{r}
+bind$WICS2 <- ifelse(bind$종목코드 %in% data_sector$CMP_CD, 
+                    data_sector$SEC_NM_KOR[match(bind$종목코드, data_sector$CMP_CD)], 
+                    'manual')
+table(bind$WICS2) # 229
+
+
+tmp <- data_sector %>% 
+  filter(data_sector['CMP_CD'] == 'A000120') %>%
+  select('CMP_CD', 'CMP_KOR', 'SEC_NM_KOR')
+tmp
+```
+
+
+```{r}
+library(dplyr)
+
+bind <- bind %>%
+  mutate(WICS2 = case_when(
+    WICS2 == 'manual' &
+      (업종명 %in% c('기타금융', '보험', '은행', '증권')) ~ '금융',
+    WICS2 == 'manual' &
+      (업종명 == '화학') ~ '에너지',
+    WICS2 == 'manual' &
+      (업종명 %in% c('철강금속', '종이목재', '비금속광물')) ~ '소재',
+    WICS2 == 'manual' &
+      (업종명 %in% c('운수창고업', '건설업', '기계')) ~ '산업재',
+    WICS2 == 'manual' &
+      (업종명 %in% c('운수장비', '유통업', '섬유의복')) ~ '경기관련소비재',
+    WICS2 == 'manual' &
+      (업종명 %in% c('음식료품', '기타제조업')) ~ '필수소비재',
+    WICS2 == 'manual' &
+      (업종명 %in% c('의약품', '의료정밀')) ~ '건강관리',
+    WICS2 == 'manual' &
+      (업종명 == '전기전자') ~ 'IT',
+    WICS2 == 'manual' &
+      (업종명 == '통신업') ~ '커뮤니케이션서비스',
+    WICS2 == 'manual' &
+      (업종명 == '전기가스업') ~ '유틸리티',
+    WICS2 == 'manual' &
+      (업종명 %in% c('광업', '농업, 임업 및 어업')) ~ 'drop',
+    WICS2 == 'manual' &
+      (업종명 == '서비스업') ~ 'manual_assignment',
+    TRUE ~ WICS2  # Keep other values as is
+  ))
+
+table(bind$WICS2)
+
+manual <- bind %>% filter(bind$WICS2 == 'manual_assignment')
+manual
+```
+
+
+# 논문 결과 확인용 
+```{r}
+#https://index.krx.co.kr/contents/MKD/03/0304/03040101/MKD03040101.jsp?upmidCd=0102&idxCd=1028&idxId=K2G01P#a110dc6b3a1678330158473e0d0ffbf0=3
+ksopi200_2012 <- read.csv("./data/2012.csv")
+ksopi200_2005 <- read.csv("./data/2005.csv")
+
+ksopi200_2012 <- ksopi200_2012 %>% select('종목코드','종목명')
+ksopi200_2005 <- ksopi200_2005 %>% select('종목코드','종목명')
+
+common_rows <- semi_join(ksopi200_2012, ksopi200_2005, by = c('종목코드'))
+
+head(common_rows)
+dim(common_rows) # 139개 
+
+
+port <- read.csv("./data/close.csv")
+port$X <- ymd(port$X)  # 날짜 형식 변환
+
+kospi200_common <- as.character(common_rows$종목코드)
+kospi200_common_modified <- sapply(kospi200_common, function(code) {
+  code <- as.character(code)
+  if (nchar(code) < 6) {
+    code <- paste0("A", strrep("0", 6 - nchar(code)), code)
+  } else if (nchar(code) == 6 && !startsWith(code, "A")) {
+    code <- paste0("A", code)
+  }
+  return(code)
+})
+
+
+# port를 관심기간만 필터링 
+valid_columns <- intersect(colnames(port), kospi200_common_modified)
+start_date <- as.Date('2005-01-03')
+end_date <- as.Date('2012-12-31')
+port_in_period <- port %>%
+    filter(X >= start_date & X <= end_date) %>%
+  select(c('X', valid_columns))
+
+
+  port_in_period[port_in_period == ""] <- NA
+  na_count <- colSums(is.na(port_in_period))
+  port_in_period <- port_in_period[, na_count == 0]
+  port_in_period
+
+  # port_in_period에 존재하는 종목만 선택
+
+  port_filtered <- port_in_period %>%
+    select(-'X') %>% 
+    mutate(across(everything(), convert_to_numeric))
+
+  # 로그 수익률 계산
+  log_returns_df <- port_filtered %>% 
+
+    mutate(across(everything(), ~log(. / lag(.)))) %>%
+    na.omit()
+  
+  # 분산이 0인 주식 제외
+  valid_cols <- sapply(log_returns_df, function(x) var(x) != 0)
+  log_returns_df <- log_returns_df[, valid_cols]
+
+  # 모든 주식 쌍에 대한 교차 상관계수 계산 139*139
+  n <- ncol(log_returns_df)
+  correlation_matrix <- matrix(NA, nrow = n, ncol = n)
+  colnames(correlation_matrix) <- names(log_returns_df)
+  rownames(correlation_matrix) <- names(log_returns_df)
+
+  for (k in 1:n) {
+    for (l in 1:n) {
+      if (k == l) {
+        correlation_matrix[k, l] <- 1
+      } else if (l > k) {
+        correlation_matrix[k, l] <- calculate_cross_correlation(log_returns_df[[k]], log_returns_df[[l]])
+        correlation_matrix[l, k] <- correlation_matrix[k, l]
+      }
+    }
+  }
+
+  print(dim(correlation_matrix))
+  
+  distance_matrix <- sqrt(2 * (1 - correlation_matrix))
+```
+
+
+```{r}
+# 주식 그래프 생성
+graph <- graph.adjacency(distance_matrix, mode="undirected", weighted=TRUE)
+graph <- simplify(graph) # 중복된 엣지와 루프 제거
+  
+# Kruskal 알고리즘을 사용하여(?) 최소신장트리(mst) 생성
+mst <- mst(graph)
+  
+plot(mst, vertex.label = NA, vertex.size = 5, edge.width = 2, edge.color = "black", layout = layout_nicely(mst))
+
+node_degrees <- degree(mst)
+
+df_node_degrees <- data.frame(node = names(node_degrees), degree = node_degrees)
+
+degree_counts <- table(node_degrees)
+df_degree_counts <- data.frame(degree = names(degree_counts), count = degree_counts)
+
+# 중복된 열 제거
+df_degree_counts$degree <- as.numeric(as.character(df_degree_counts$degree))  # 'degree' 열을 숫자형으로 변환
+df_degree_counts <- df_degree_counts[, c("degree", "count.Freq")]
+
+# 연결선 수 별 비율 계산
+total_nodes <- sum(df_degree_counts$count.Freq)
+df_degree_counts$proportion <- round(df_degree_counts$count.Freq / total_nodes,3)
+
+# 결과 확인
+print(df_degree_counts)
+
+nodes_with_degree_10 <- which(node_degrees == 10)
+stock_codes_degree_10 <- V(mst)$name[nodes_with_degree_10] ;stock_codes_degree_10
+
+nodes_with_degree_9 <- which(node_degrees == 9)
+stock_codes_degree_9 <- V(mst)$name[nodes_with_degree_9] ;stock_codes_degree_9
+```
+
+
+
+
+
+# * 다시 반복문으로 (원래 순서)
+
+```{r}
+# 각 시점에 대한 반복 처리
+for (i in 1:(ncol(top) - 1)) {
+  
+  date_col <- colnames(top)[i + 1]
+  print(i)
+  # 해당 시점의 상위 50개 기업 리스트 추출
+  current_list <- top[[date_col]]
+  
+  # 초기화
+  port_filtered <- data.frame()  # port 필터링 결과 초기화
+  log_returns_df <- data.frame()  # 로그 수익률 데이터 프레임 초기화
+  correlation_matrix <- matrix()  # 상관계수 행렬 초기화
+  distance_matrix <- matrix()  # 거리 행렬 초기화
+  graph <- igraph::make_empty_graph(0)  # 그래프 객체 초기화
+  selected_stocks <- vector("list", length = 10)  # 선택된 주식 리스트 초기화
+
+  
+  # 해당 기간의 데이터 필터링 및 전처리
+  start_date <- as.Date(sub("X", "", date_col), format = "%Y.%m.%d")
+  if (i == ncol(top) - 1) {
+    # 마지막 시점의 경우, 특정 기간으로 설정
+    end_date <- start_date + days(27) # 20영업일.. 
+  } else {
+    # 다음 시점의 시작 날짜를 end_date로 설정
+    end_date <- as.Date(sub("X", "", colnames(top)[i + 2]), format = "%Y.%m.%d") - days(1)
+  }
+
+  # port에서 해당 기간 데이터 필터링 & NA인 값이 있는 열 제거
+
+  port_in_period <- port %>%
+    filter(X >= start_date & X <= end_date)
+  
+  port_in_period[port_in_period == ""] <- NA
+  na_count <- colSums(is.na(port_in_period))
+  port_in_period <- port_in_period[, na_count == 0]
+  port_in_period
+
+  # port_in_period에 존재하는 종목만 선택
+  existing_cols <- intersect(current_list, names(port_in_period))
+  port_filtered <- port_in_period %>%
+    select(all_of(existing_cols)) %>%
+    mutate(across(everything(), convert_to_numeric))
+
+  # 로그 수익률 계산
+  log_returns_df <- port_filtered %>%
+    mutate(across(everything(), ~log(. / lag(.)))) %>%
+    na.omit()
+  
+  # 분산이 0인 주식 제외
+  valid_cols <- sapply(log_returns_df, function(x) var(x) != 0)
+  log_returns_df <- log_returns_df[, valid_cols]
+
+  # 모든 주식 쌍에 대한 교차 상관계수 계산
+  n <- ncol(log_returns_df)
+  correlation_matrix <- matrix(NA, nrow = n, ncol = n)
+  colnames(correlation_matrix) <- names(log_returns_df)
+  rownames(correlation_matrix) <- names(log_returns_df)
+
+  for (k in 1:n) {
+    for (l in 1:n) {
+      if (k == l) {
+        correlation_matrix[k, l] <- 1
+      } else if (l > k) {
+        correlation_matrix[k, l] <- calculate_cross_correlation(log_returns_df[[k]], log_returns_df[[l]])
+        correlation_matrix[l, k] <- correlation_matrix[k, l]
+      }
+    }
+  }
+
+  print(dim(correlation_matrix))
+  
+  distance_matrix <- sqrt(2 * (1 - correlation_matrix))
+
+  # 주식 그래프 생성
+  graph <- graph.adjacency(distance_matrix, mode="undirected", weighted=TRUE)
+  graph <- simplify(graph) # 중복된 엣지와 루프 제거
+  mst <- mst(graph)
+  degrees <- degree(mst)
+  #plot(mst)
+  
+  #  업종별 분류 진행
+  company_to_sector <- setNames(WICS_122$SEC_NM_KOR, WICS_122$CMP_CD)
+  
+  # correlation_matrix의 컬럼명에 해당하는 업종명 찾기
+  sector_names <- company_to_sector[colnames(correlation_matrix)]
+  
+  # 각 업종명에 해당하는 주식을 초기화 . 9개면 9개 
+  selected_stocks <- vector("list", length = length(unique(sector_names)))
+
+  # A068270 A008930
+  
+  # 각 업종별 주식 수 계산
+  sector_counts <- table(sector_names)
+
+  # 가장 많은 주식을 가진 업종 찾기
+  most_common_sector <- names(which.max(sector_counts))
+
+  cat(date_col,"시점의 종목 수 : ",length(unique(sector_names)),"\n")
+  
+  for (j in 1:length(unique(sector_names))) {
+    cat(j,unique(sector_names)[j],"\n")
+    
+    sector_name <- unique(sector_names)[j]
+    
+    cluster_stocks <- names(which(sector_names == sector_name))
+
+  if (length(cluster_stocks) == 1) {
+    # 클러스터 내 주식이 하나만 있는 경우, 해당 주식을 바로 선택
+    selected_stocks[[j]] <- cluster_stocks
+    next  # 다음 클러스터로 넘어갑니다
+    } else if (length(cluster_stocks) > 1) {
+    # 해당 클러스터에 속하는 주식들의 degree 추출
+    valid_stocks <- intersect(cluster_stocks, names(degrees))
+    degrees_in_cluster <- degrees[valid_stocks]
+
+    # 해당 클러스터 내에서 가장 낮은 degree를 가진 주식 선택
+    min_degree_stock <- names(which(degrees_in_cluster == min(degrees_in_cluster)))
+    
+    # 가장 낮은 degree의 주식이 여러 개 있는 경우 무작위로 하나 선택
+    selected_stocks[[j]] <- sample(min_degree_stock, 1)
+    }
+  }
+  
+  
+  # 선택된. 주식 리스트 저장
+  #selected_stocks_df[[date_col]] <- unlist(selected_stocks)
+  
+  #selected_stocks_df[, date_col] <- c(unlist(selected_stocks), rep(NA, 10 - length(unlist(selected_stocks))))
+
+}
+selected_stocks_df
+
+#write.csv(selected_stocks_df, "./data/asset_10sector.csv", row.names = FALSE)
+
+```
+
+## 9개인거 채우기 
+```{r}
+# 각 시점에 대한 반복 처리
+for (i in 1:(ncol(top) - 1)) {
+  
+  date_col <- colnames(top)[i + 1]
+  print(i)
+  # 해당 시점의 상위 50개 기업 리스트 추출
+  current_list <- top[[date_col]]
+  
+  # 초기화
+  port_filtered <- data.frame()  # port 필터링 결과 초기화
+  log_returns_df <- data.frame()  # 로그 수익률 데이터 프레임 초기화
+  correlation_matrix <- matrix()  # 상관계수 행렬 초기화
+  distance_matrix <- matrix()  # 거리 행렬 초기화
+  graph <- igraph::make_empty_graph(0)  # 그래프 객체 초기화
+  selected_stocks <- vector("list", length = 10)  # 선택된 주식 리스트 초기화
+
+  
+  # 해당 기간의 데이터 필터링 및 전처리
+  start_date <- as.Date(sub("X", "", date_col), format = "%Y.%m.%d")
+  if (i == ncol(top) - 1) {
+    # 마지막 시점의 경우, 특정 기간으로 설정
+    end_date <- start_date + days(27) # 20영업일.. 
+  } else {
+    # 다음 시점의 시작 날짜를 end_date로 설정
+    end_date <- as.Date(sub("X", "", colnames(top)[i + 2]), format = "%Y.%m.%d") - days(1)
+  }
+
+  # port에서 해당 기간 데이터 필터링 & NA인 값이 있는 열 제거
+
+  port_in_period <- port %>%
+    filter(X >= start_date & X <= end_date)
+  
+  port_in_period[port_in_period == ""] <- NA
+  na_count <- colSums(is.na(port_in_period))
+  port_in_period <- port_in_period[, na_count == 0]
+  port_in_period
+
+  # port_in_period에 존재하는 종목만 선택
+  existing_cols <- intersect(current_list, names(port_in_period))
+  port_filtered <- port_in_period %>%
+    select(all_of(existing_cols)) %>%
+    mutate(across(everything(), convert_to_numeric))
+
+  # 로그 수익률 계산
+  log_returns_df <- port_filtered %>%
+    mutate(across(everything(), ~log(. / lag(.)))) %>%
+    na.omit()
+  
+  # 분산이 0인 주식 제외
+  valid_cols <- sapply(log_returns_df, function(x) var(x) != 0)
+  log_returns_df <- log_returns_df[, valid_cols]
+
+  # 모든 주식 쌍에 대한 교차 상관계수 계산
+  n <- ncol(log_returns_df)
+  correlation_matrix <- matrix(NA, nrow = n, ncol = n)
+  colnames(correlation_matrix) <- names(log_returns_df)
+  rownames(correlation_matrix) <- names(log_returns_df)
+
+  for (k in 1:n) {
+    for (l in 1:n) {
+      if (k == l) {
+        correlation_matrix[k, l] <- 1
+      } else if (l > k) {
+        correlation_matrix[k, l] <- calculate_cross_correlation(log_returns_df[[k]], log_returns_df[[l]])
+        correlation_matrix[l, k] <- correlation_matrix[k, l]
+      }
+    }
+  }
+
+  print(dim(correlation_matrix))
+  
+  distance_matrix <- sqrt(2 * (1 - correlation_matrix))
+
+  # 주식 그래프 생성
+  graph <- graph.adjacency(distance_matrix, mode="undirected", weighted=TRUE)
+  graph <- simplify(graph) # 중복된 엣지와 루프 제거
+  mst <- mst(graph)
+  degrees <- degree(mst)
+  #plot(mst)
+  
+  #  업종별 분류 진행
+  company_to_sector <- setNames(WICS_122$SEC_NM_KOR, WICS_122$CMP_CD)
+  
+  # correlation_matrix의 컬럼명에 해당하는 업종명 찾기
+  sector_names <- company_to_sector[colnames(correlation_matrix)]
+  
+  # 각 업종명에 해당하는 주식을 초기화 . 9개면 9개 
+  selected_stocks <- vector("list", length = length(unique(sector_names)))
+
+  # A068270 A008930
+  
+  # 각 업종별 주식 수 계산
+  sector_counts <- table(sector_names)
+
+  # 가장 많은 주식을 가진 업종 찾기
+  most_common_sector <- names(which.max(sector_counts))
+
+  cat(date_col,"시점의 종목 수 : ",length(unique(sector_names)),"\n")
+  
+
+for (j in 1:length(unique(sector_names))) {
+  sector_name <- unique(sector_names)[j]
+  cluster_stocks <- names(which(sector_names == sector_name))
+  valid_stocks <- intersect(cluster_stocks, names(degrees))
+  degrees_in_cluster <- degrees[valid_stocks]
+  min_degree_stock <- names(which(degrees_in_cluster == min(degrees_in_cluster)))
+
+  if (length(unique(sector_names)) == 10 || length(unique(sector_names)) == 9) {
+    selected_stocks[[j]] <- sample(min_degree_stock, 1)
+  }
+}
+
+# 업종이 9개인 경우, 가장 많은 주식을 포함한 업종에서 추가 주식 선택
+if (length(unique(sector_names)) == 9) {
+  most_common_sector <- names(which.max(table(sector_names)))
+  most_common_stocks <- names(which(sector_names == most_common_sector))
+  valid_stocks <- intersect(most_common_stocks, names(degrees))
+  degrees_in_common <- degrees[valid_stocks]
+  min_degree_common_stock <- names(which(degrees_in_common == min(degrees_in_common)))
+
+  # 가장 많은 업종에서 추가 주식 선택
+  if (!is.null(min_degree_common_stock) && length(min_degree_common_stock) > 0) {
+    selected_stocks[[10]] <- sample(min_degree_common_stock, 1)
+  }
+}
+  
+  
+  # 선택된. 주식 리스트 저장
+  selected_stocks_df[[date_col]] <- unlist(selected_stocks)
+
+
+}
+selected_stocks_df
+
+#write.csv(selected_stocks_df, "./data/selected_10.csv", row.names = FALSE)
+```
+
+# 네트워크 그리기용
+```{r}
+network <-read.csv("./data/selected_10.csv")
+#WICS_122 <- read.csv("./data/WICS_122.csv")
+top <- read.csv("./data/top50_df2.csv")
+port <- read.csv("./data/close.csv")
+# 임의의 시점 
+i = 50 
+date_col <- colnames(top)[i + 1]
+  print(i)
+  # 해당 시점의 상위 50개 기업 리스트 추출
+  current_list <- top[[date_col]]
+  
+  # 초기화
+  port_filtered <- data.frame()  # port 필터링 결과 초기화
+  log_returns_df <- data.frame()  # 로그 수익률 데이터 프레임 초기화
+  correlation_matrix <- matrix()  # 상관계수 행렬 초기화
+  distance_matrix <- matrix()  # 거리 행렬 초기화
+  graph <- igraph::make_empty_graph(0)  # 그래프 객체 초기화
+  selected_stocks <- vector("list", length = 10)  # 선택된 주식 리스트 초기화
+
+  
+  # 해당 기간의 데이터 필터링 및 전처리
+  start_date <- as.Date(sub("X", "", date_col), format = "%Y.%m.%d")
+  if (i == ncol(top) - 1) {
+    # 마지막 시점의 경우, 특정 기간으로 설정
+    end_date <- start_date + days(27) # 20영업일.. 
+  } else {
+    # 다음 시점의 시작 날짜를 end_date로 설정
+    end_date <- as.Date(sub("X", "", colnames(top)[i + 2]), format = "%Y.%m.%d") - days(1)
+  }
+
+  # port에서 해당 기간 데이터 필터링 & NA인 값이 있는 열 제거
+
+  port_in_period <- port %>%
+    filter(X >= start_date & X <= end_date)
+  
+  port_in_period[port_in_period == ""] <- NA
+  na_count <- colSums(is.na(port_in_period))
+  port_in_period <- port_in_period[, na_count == 0]
+  port_in_period
+
+  # port_in_period에 존재하는 종목만 선택
+  existing_cols <- intersect(current_list, names(port_in_period))
+  port_filtered <- port_in_period %>%
+    select(all_of(existing_cols)) %>%
+    mutate(across(everything(), convert_to_numeric))
+
+  # 로그 수익률 계산
+  log_returns_df <- port_filtered %>%
+    mutate(across(everything(), ~log(. / lag(.)))) %>%
+    na.omit()
+  
+  # 분산이 0인 주식 제외
+  valid_cols <- sapply(log_returns_df, function(x) var(x) != 0)
+  log_returns_df <- log_returns_df[, valid_cols]
+
+  # 모든 주식 쌍에 대한 교차 상관계수 계산
+  n <- ncol(log_returns_df)
+  correlation_matrix <- matrix(NA, nrow = n, ncol = n)
+  colnames(correlation_matrix) <- names(log_returns_df)
+  rownames(correlation_matrix) <- names(log_returns_df)
+
+  for (k in 1:n) {
+    for (l in 1:n) {
+      if (k == l) {
+        correlation_matrix[k, l] <- 1
+      } else if (l > k) {
+        correlation_matrix[k, l] <- calculate_cross_correlation(log_returns_df[[k]], log_returns_df[[l]])
+        correlation_matrix[l, k] <- correlation_matrix[k, l]
+      }
+    }
+  }
+
+  print(dim(correlation_matrix))
+  
+  distance_matrix <- sqrt(2 * (1 - correlation_matrix))
+
+  # 주식 그래프 생성
+  graph <- graph.adjacency(distance_matrix, mode="undirected", weighted=TRUE)
+  graph <- simplify(graph) # 중복된 엣지와 루프 제거
+  mst <- mst(graph)
+  degrees <- degree(mst)
+  #plot(mst)
+  
+  #  업종별 분류 진행
+  company_to_sector <- setNames(WICS_122$SEC_NM_KOR, WICS_122$CMP_CD)
+
+# correlation_matrix의 컬럼명에 해당하는 업종명 찾기
+sector_names <- company_to_sector[colnames(correlation_matrix)]
+
+# nodes 데이터 프레임 생성
+nodes <- data.frame(
+  id = names(sector_names),
+  name = WICS_122$CMP_KOR[match(names(sector_names), WICS_122$CMP_CD)],
+  sector = sector_names,
+  stringsAsFactors = FALSE
+)
+selected_ids <- unlist(network[date_col])
+nodes$selected <- ifelse(nodes$id %in% selected_ids, 1, 0)
+
+# write.csv(nodes, "./data/nodes.csv", row.names = FALSE)
+
+# mst 객체에서 엣지 추출
+edges <- get.edgelist(mst)
+
+# 엣지의 가중치 추출
+weights <- E(mst)$weight
+
+# 엣지와 가중치를 결합하여 데이터 프레임 생성
+links_df <- data.frame(source = edges[, 1], target = edges[, 2], value = weights)
+
+# links.csv 파일로 저장
+#write.csv(links_df, "./data/links.csv", row.names = FALSE)
+
+layout <- layout_with_fr(mst) # 다른 레아웃 쓰면 다른 좌표 나옴 
+nodes$x <- layout[,1]
+nodes$y <- layout[,2]
+
+relationship <- vector("list", nrow(links_df))
+for (i in 1:nrow(links_df)) {
+    relationship[i] <- paste0(links_df$source[i], "->", links_df$target[i])
+}
+relationship <- unlist(relationship)
+
+
+links_concated <- data.frame(
+  id = c(links_df$source,links_df$target),
+  value = c(links_df$value,links_df$value),
+  relationship = c(relationship,relationship)
+)
+
+merged_data <- merge(links_concated, nodes, by = "id")
+
+links_concated$x <- merged_data$x
+links_concated$y <- merged_data$y
+
+#write.csv(links_concated, "./data/links_concated.csv", row.names = FALSE)
+#write.csv(merged_data, "./data/links_concated2.csv", row.names = FALSE)
+```
+
+
+```{r}
+library(RColorBrewer)
+
+# 클러스터링 결과에 따른 색상 지정
+cluster_colors <- brewer.pal(10, "Paired")
+names(cluster_colors) <- 1:10
+
+# 최종 선택된 주식에 대한 모양 지정
+selected_shape <- "triangle"
+default_shape <- "circle"
+
+# MST 그래프 그리기
+for (i in 1:(ncol(top) - 1)) {
+  # ... 기존 루프 코드 ...
+
+  # MST 그리기
+  V(mst)$color <- cluster_colors[clusters]
+  V(mst)$shape <- ifelse(names(V(mst)) %in% unlist(selected_stocks), selected_shape, default_shape)
+
+  png(file = paste0("mst_", sub("X", "", date_col), ".png"))
+  plot(mst, vertex.label = NA, vertex.size = 5, edge.width = 2, edge.color = "black", layout = layout_nicely(mst))
+  dev.off()
+}
+```
+
+
+
+```{r}
+# 그래프 지표
+
+g <- graph.formula(A-B-D, C-D-F, E-D-F, E-F)
+V(g)$size = 20
+V(g)$label.cex = 2
+
+set.seed(1234)
+plot(g)
+
+degree(g)
+graph.density(g)
+degree.distribution(g)
+
+#차수 분포 그래프 그리기
+plot(degree.distribution(g), xlab ="node degree")
+lines(degree.distribution(g))
+
+n <- vcount(g)
+degree.centrality <- degree(g)/(n-1) # degree centrality
+
+closeness(g)
+betweenness(g)
+```
+
